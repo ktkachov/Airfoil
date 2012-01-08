@@ -6,6 +6,7 @@ import static utils.Utils.float_t;
 
 import com.maxeler.maxcompiler.v1.kernelcompiler.Kernel;
 import com.maxeler.maxcompiler.v1.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v1.kernelcompiler.SMIO;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Count;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Count.Counter;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Count.WrapMode;
@@ -32,7 +33,7 @@ public class ResCalcKernel extends Kernel {
 //	private final KStructType.StructFieldType q2_f = KStructType.sft("q2", array4_t);
 //	private final KStructType.StructFieldType adt1_f = KStructType.sft("adt1", float_t);
 //	private final KStructType.StructFieldType adt2_f = KStructType.sft("adt2", float_t);
-	private final KStructType res_struct_t
+	private final KStructType input_struct_t
 		= new KStructType(
 				KStructType.sft("x1", array2_t),
 				KStructType.sft("x2", array2_t),
@@ -41,6 +42,12 @@ public class ResCalcKernel extends Kernel {
 				KStructType.sft("adt1", float_t),
 				KStructType.sft("adt2", float_t)
 			);
+
+	private final KStructType res_struct_t
+		= new KStructType(
+				KStructType.sft("res1", array4_t),
+				KStructType.sft("res2", array4_t)
+		);
 
 
 	public ResCalcKernel(KernelParameters params) {
@@ -58,34 +65,21 @@ public class ResCalcKernel extends Kernel {
 
 		Counter nhd1_in_count = control.count.makeCounter(count_params);
 
-		count_params = control.count.makeParams(input_data_count_width)
-						.withMax(nhd2Size)
-						.withWrapMode(WrapMode.STOP_AT_MAX)
-						.withEnable(nhd1_in_count.getCount() . eq(nhd1Size));
-
-		Counter nhd2_in_count = control.count.makeCounter(count_params);
-
-		HWVar totalSize = nhd1Size + nhd2Size + intraHaloSize;
-
-		HWVar kernel_count = control.count.simpleCounter(48);
-		HWVar input_enabled = kernel_count . lte(totalSize.cast(kernel_count.getType()));
-//		HWVar nhd1_in_enable = nhd1_in_count.getCount() . neq(nhd1Size);
-
-
-
-		KStruct input_data = io.input("input", res_struct_t);
+		SMIO read_from_host = addStateMachine("host_read", new ResInputSM(this, 10));
+		KStruct input_data_dram = io.input("input_dram", input_struct_t);
+		KStruct input_data_host = io.input("input_host", input_struct_t, read_from_host.getOutput("output"));
 
 		HWVar gm1 = io.scalarInput("gm1", float_t);
 		HWVar eps = io.scalarInput("eps", float_t);
 
 		Count.Params ram_write_count_params = control.count.makeParams(MathUtils.bitsToAddress(partition_size));
 		Counter ram_write_count = control.count.makeCounter(ram_write_count_params);
-		RamPortParams<KStruct> ram_params_write = mem.makeRamPortParams(RamPortMode.WRITE_ONLY, ram_write_count.getCount(), input_data.getType())
-													.withDataIn(input_data);
+		RamPortParams<KStruct> ram_params_write = mem.makeRamPortParams(RamPortMode.WRITE_ONLY, ram_write_count.getCount(), input_data_dram.getType())
+													.withDataIn(input_data_dram);
 
 		Count.Params ram_read_count_params = control.count.makeParams(MathUtils.bitsToAddress(partition_size));
 		Counter ram_read_count = control.count.makeCounter(ram_read_count_params);
-		RamPortParams<KStruct> ram_params_read = mem.makeRamPortParams(RamPortMode.READ_ONLY, ram_read_count.getCount(), input_data.getType());
+		RamPortParams<KStruct> ram_params_read = mem.makeRamPortParams(RamPortMode.READ_ONLY, ram_read_count.getCount(), input_data_dram.getType());
 
 		KStruct ram_output = mem.ramDualPort(partition_size, RamWriteMode.READ_FIRST, ram_params_write, ram_params_read).getOutputB();
 
@@ -107,8 +101,9 @@ public class ResCalcKernel extends Kernel {
 		HWVar p2 = gm1*(q2[3]-0.5f*ri*(q2[1]*q2[1]+q2[2]*q2[2]));
 		HWVar vol2 = ri*(q2[1]*dy - q2[2]*dx);
 
-		KArray<HWVar> res1 = array4_t.newInstance(this);
-		KArray<HWVar> res2 = array4_t.newInstance(this);
+		KStruct result = res_struct_t.newInstance(this);
+		KArray<HWVar> res1 = result["res1"];
+		KArray<HWVar> res2 = result["res2"];
 
 		HWVar f = 0.5f*(vol1* q1[0] + vol2* q2[0]) + mu*(q1[0]-q2[0]);
 		res1[0] <== f;
@@ -126,8 +121,9 @@ public class ResCalcKernel extends Kernel {
 		res1[3] <== f;
 		res2[3] <== -f;
 
-		io.output("res1", res1.getType()) <== res1;
-		io.output("res2", res2.getType()) <== res2;
+		io.output("result", result.getType()) <== result;
 	}
+
+
 
 }

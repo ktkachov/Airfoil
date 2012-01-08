@@ -3,39 +3,36 @@ package airfoil;
 import com.maxeler.maxcompiler.v1.managers.MAXBoardModel;
 import com.maxeler.maxcompiler.v1.managers.custom.CustomManager;
 import com.maxeler.maxcompiler.v1.managers.custom.Stream;
+import com.maxeler.maxcompiler.v1.managers.custom.blocks.Fanout;
 import com.maxeler.maxcompiler.v1.managers.custom.blocks.KernelBlock;
+import com.maxeler.maxcompiler.v1.managers.custom.stdlib.MemoryControlGroup;
 
 public class AifoilManager extends CustomManager {
 
-	public AifoilManager(MAXBoardModel board_model, String name, int numReps) {
-		super(board_model, name);
+	public AifoilManager(MAXBoardModel board_model, String name) {
+		super(board_model, name, CustomManager.Target.MAXFILE_FOR_HARDWARE);
 
-//			KernelBlock adtCalc = addKernel(new ADTKernel(makeKernelParameters("ADTCalcKernel")));
-//			Stream q = addStreamFromHost("q");
-//			adtCalc.getInput("q") <== q;
-//			Stream[] xs = new Stream[4];
-//			for (int j = 0; j < xs.length; ++j) {
-//				xs[j] = addStreamFromHost("x"+(j+1));
-//				adtCalc.getInput("x"+(j+1)) <== xs[j];
-//			}
-//			Stream adt = addStreamToHost("adt");
-//			adt <== adtCalc.getOutput("adt");
+		MemoryControlGroup control = addMemoryControlGroup("control", MemoryControlGroup.MemoryAccessPattern.LINEAR_1D);
+
 		KernelBlock resCalc = addKernel(new ResCalcKernel(makeKernelParameters("ResCalcKernel")));
-		Stream in = addStreamFromHost("input");
-		resCalc.getInput("input") <== in;
-		addStreamToHost("res1") <== resCalc.getOutput("res1");
-		addStreamToHost("res2") <== resCalc.getOutput("res2");
+		Stream in_host = addStreamFromHost("input");
+		Stream in_dram = addStreamFromOnCardMemory("input_dram", control);
+
+
+		resCalc.getInput("input_host") <== in_host;
+		resCalc.getInput("input_dram") <== in_dram;
+
+		Stream result = resCalc.getOutput("result");
+		Fanout fanout = fanout("dummy_fanout");
+		fanout.getInput() <== result;
+
+		Stream to_host = addStreamToHost("res");
+		to_host <== fanout.addOutput("to_host");
+		Stream to_dram = addStreamToOnCardMemory("to_dram", control);
+		to_dram <== fanout.addOutput("to_dram");
 
 
 		config.setAllowNonMultipleTransitions(true);//FIXME: Must remove later!!!!!!
-
-
-//		KernelBlock adtCalc = addKernel(new ADTKernel(makeKernelParameters("ADTCalcKernel")));
-//		KernelBlock resCalc = addKernel(new ResCalcKernel(makeKernelParameters("ResCalcKernel")));
-//		KernelBlock bresCalc = addKernel(new BResCalcKernel(makeKernelParameters("BResCalcKernel")));
-//		KernelBlock update = addKernel(new UpdateKernel(makeKernelParameters("UpdateKernel")));
-
-
 	}
 
 
