@@ -9,6 +9,7 @@ import com.maxeler.maxcompiler.v1.kernelcompiler.KernelParameters;
 import com.maxeler.maxcompiler.v1.kernelcompiler.SMIO;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Count;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Count.WrapMode;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Mem.RamPortMode;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Mem.RamPortParams;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Mem.RamWriteMode;
@@ -22,9 +23,9 @@ import com.maxeler.maxcompiler.v1.utils.MathUtils;
 
 public class ResCalcKernel extends Kernel {
 
-	private final int input_data_count_width = 32;
+	private final int max_partition_size = 1<<14;
+	private final int input_data_count_width = MathUtils.bitsToAddress(max_partition_size);
 	private final HWType input_data_count_t = hwUInt(input_data_count_width);
-	private final int partition_size = 1<<10;
 	private final int halo_size = 1<<7;
 
 	private final KStructType input_struct_t
@@ -47,30 +48,60 @@ public class ResCalcKernel extends Kernel {
 	public ResCalcKernel(KernelParameters params) {
 		super(params);
 
+		final int addr_width = MathUtils.bitsToAddress(max_partition_size);
+
+
 		HWVar nhd1Size = io.scalarInput("nhd1Size", input_data_count_t);
 		HWVar nhd2Size = io.scalarInput("nhd2Size", input_data_count_t);
 		HWVar intraHaloSize = io.scalarInput("intraHaloSize", input_data_count_t);
 		HWVar haloDataSize = io.scalarInput("halo_size", input_data_count_t);
 
+		HWVar partition_size = nhd1Size + nhd2Size + intraHaloSize;
+
+		Count.Params input_counter_params = control.count.makeParams(addr_width)
+			.withMax(partition_size)
+			.withWrapMode(WrapMode.STOP_AT_MAX);
+
+		HWVar input_count = control.count.makeCounter(input_counter_params).getCount();
+
+		HWVar process_partition = input_count >=(nhd1Size + intraHaloSize);
+		HWVar finished_reading = input_count >= partition_size;
+
+		Count.Params process_counter_params = control.count.makeParams(addr_width)
+			.withMax(partition_size)
+			.withWrapMode(WrapMode.STOP_AT_MAX)
+			.withEnable(process_partition);
+
+		HWVar process_counter = control.count.makeCounter(process_counter_params).getCount();
+		HWVar finished_processing = process_counter >= partition_size;
+
+		Count.Params write_output_params = control.count.makeParams(addr_width)
+			.withEnable(finished_processing)
+			.withMax(partition_size)
+			.withWrapMode(WrapMode.STOP_AT_MAX);
+
+		HWVar output_counter = control.count.makeCounter(write_output_params).getCount();
+
+		HWVar address = io.input("address", hwUInt(addr_width));
+
 		SMIO read_from_host_sm = addStateMachine("host_read", new ResInputSM(this, 10));
 		HWVar read_from_host = read_from_host_sm.getOutput("output");
-		KStruct input_data_dram = io.input("input_dram", input_struct_t);
+		KStruct input_data_dram = io.input("input_dram", input_struct_t, ~finished_reading);
 		KStruct input_data_host = io.input("input_host", input_struct_t, read_from_host);
 
 		HWVar gm1 = io.scalarInput("gm1", float_t);
 		HWVar eps = io.scalarInput("eps", float_t);
 
-		Count.Params ram_write_count_params = control.count.makeParams(MathUtils.bitsToAddress(partition_size));
-		Counter ram_write_count = control.count.makeCounter(ram_write_count_params);
-		RamPortParams<KStruct> ram_params_write = mem.makeRamPortParams(RamPortMode.WRITE_ONLY, ram_write_count.getCount(), input_data_dram.getType())
-													.withDataIn(input_data_dram);
 
-		Count.Params ram_read_count_params = control.count.makeParams(MathUtils.bitsToAddress(partition_size));
-		Counter ram_read_count = control.count.makeCounter(ram_read_count_params);
-		RamPortParams<KStruct> ram_params_read = mem.makeRamPortParams(RamPortMode.READ_ONLY, ram_read_count.getCount(), input_data_dram.getType());
+		RamPortParams<KStruct> ram_params_read
+			= mem.makeRamPortParams(RamPortMode.READ_ONLY, address, input_data_dram.getType());
 
-		KStruct ram_output = mem.ramDualPort(partition_size, RamWriteMode.READ_FIRST, ram_params_write, ram_params_read).getOutputB();
 
+		RamPortParams<KStruct> ram_params_write = mem.makeRamPortParams(RamPortMode.WRITE_ONLY, input_count, input_data_dram.getType())
+			.withDataIn(input_data_dram)
+			.withWriteEnable(~finished_reading);
+
+		KStruct partition_data = mem.ramDualPort(max_partition_size, RamWriteMode.READ_FIRST, ram_params_write, ram_params_read).getOutputB();
 
 
 		Count.Params host_ram_write_count_params = control.count.makeParams(MathUtils.bitsToAddress(halo_size))
@@ -85,14 +116,32 @@ public class ResCalcKernel extends Kernel {
 
 		KStruct host_ram_output = mem.ramDualPort(halo_size, RamWriteMode.READ_FIRST, host_ram_params_write, host_ram_params_read).getOutputB();
 
-		KStruct result_dram = doResMath(ram_output, eps, gm1);
-		KStruct result_host = doResMath(host_ram_output, eps, gm1);
 
-		io.output("result_dram", result_dram.getType()) <== result_dram;
-		io.output("result_host", result_host.getType()) <== result_host;
+		KStruct res_ram_contents = res_struct_t.newInstance(this);
+
+		KStruct partition_result = doResMath(partition_data, eps, gm1, res_ram_contents);
+//		KStruct result_host = doResMath(host_ram_output, eps, gm1, res_ram_contents);
+
+
+
+		RamPortParams<KStruct> write_res_params
+			= mem.makeRamPortParams(RamPortMode.WRITE_ONLY, address, partition_result.getType())
+				.withDataIn(partition_result).withWriteEnable(process_partition);
+
+		HWVar res_ram_address = finished_processing ? output_counter : address;
+		RamPortParams<KStruct> read_res_params
+			= mem.makeRamPortParams(RamPortMode.READ_ONLY, res_ram_address, partition_result.getType());
+
+		KStruct res_ram_output = mem.ramDualPort(max_partition_size, RamWriteMode.READ_FIRST, write_res_params, read_res_params).getOutputB();
+		res_ram_contents <== stream.offset(res_ram_output, -14); //FIXME: EXPLAIN!!!
+
+		io.output("result_dram", partition_result.getType(), finished_processing) <== partition_result;
+//		io.output("result_host", result_host.getType()) <== result_host;
 	}
 
-	KStruct doResMath(KStruct input_data, HWVar eps, HWVar gm1){
+
+	// The math that produce the res1 and res2 vectors
+	KStruct doResMath(KStruct input_data, HWVar eps, HWVar gm1, KStruct current_res){
 
 		KArray<HWVar> x1 = input_data["x1"];
 		KArray<HWVar> x2 = input_data["x2"];
@@ -115,22 +164,24 @@ public class ResCalcKernel extends Kernel {
 		KStruct result = res_struct_t.newInstance(this);
 		KArray<HWVar> res1 = result["res1"];
 		KArray<HWVar> res2 = result["res2"];
+		KArray<HWVar> curr_res1 = current_res["res1"];
+		KArray<HWVar> curr_res2 = current_res["res2"];
 
 		HWVar f = 0.5f*(vol1* q1[0] + vol2* q2[0]) + mu*(q1[0]-q2[0]);
-		res1[0] <== f;
-		res2[0] <== -f;
+		res1[0] <== curr_res1[0] + f;
+		res2[0] <== curr_res2[0] - f;
 
 		f = 0.5f*(vol1* q1[1] + p1*dy + vol2* q2[1] + p2*dy) + mu*(q1[1]-q2[1]);
-		res1[1] <== f;
-		res2[1] <== -f;
+		res1[1] <== curr_res1[1] + f;
+		res2[1] <== curr_res2[1] - f;
 
 		f = 0.5f*(vol1* q1[2] - p1*dx + vol2* q2[2] - p2*dx) + mu*(q1[2]-q2[2]);
-		res1[2] <== f;
-		res2[2] <== -f;
+		res1[2] <== curr_res1[2] + f;
+		res2[2] <== curr_res2[2] - f;
 
 		f = 0.5f*(vol1*(q1[3]+p1)     + vol2*(q2[3]+p2)    ) + mu*(q1[3]-q2[3]);
-		res1[3] <== f;
-		res2[3] <== -f;
+		res1[3] <== curr_res1[3] + f;
+		res2[3] <== curr_res2[3] - f;
 
 		return result;
 

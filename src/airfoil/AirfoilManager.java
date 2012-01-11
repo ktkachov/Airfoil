@@ -14,13 +14,14 @@ public class AirfoilManager extends CustomManager {
 		KernelBlock resCalc = addKernel(new ResCalcKernel(makeKernelParameters("ResCalcKernel")));
 		Stream in_host = addStreamFromHost("input");
 		Stream in_dram = addStreamFromOnCardMemory("from_fram", MemoryAccessPattern.LINEAR_1D);
-
+		Stream in_dram_address = addStreamFromOnCardMemory("address_from_dram", MemoryAccessPattern.LINEAR_1D);
 
 		resCalc.getInput("input_host") <== in_host;
 		resCalc.getInput("input_dram") <== in_dram;
+		resCalc.getInput("address") <== in_dram_address;
 
-		Stream to_host = addStreamToHost("res");
-		to_host <== resCalc.getOutput("result_host");
+//		Stream to_host = addStreamToHost("res");
+//		to_host <== resCalc.getOutput("result_host");
 		Stream to_dram = addStreamToOnCardMemory("to_dram", MemoryAccessPattern.LINEAR_1D);
 		to_dram <== resCalc.getOutput("result_dram");
 
