@@ -1,0 +1,120 @@
+package airfoil;
+
+import com.maxeler.maxcompiler.v1.kernelcompiler.KernelLib;
+import com.maxeler.maxcompiler.v1.statemachine.SMInput;
+import com.maxeler.maxcompiler.v1.statemachine.SMOutput;
+import com.maxeler.maxcompiler.v1.statemachine.SMStateEnum;
+import com.maxeler.maxcompiler.v1.statemachine.SMStateValue;
+import com.maxeler.maxcompiler.v1.statemachine.SMValue;
+import com.maxeler.maxcompiler.v1.statemachine.kernel.KernelStateMachine;
+
+public class ResControlSM extends KernelStateMachine {
+
+		public enum ReadingStates{
+			ENABLED,
+			DISABLED
+		}
+
+		public enum ProcessingStates{
+			ENABLED,
+			DISABLED
+		}
+
+		public enum WritingStates{
+			ENABLED,
+			DISABLED
+		}
+
+		private final SMStateValue read_count;
+		private final SMStateValue process_count;
+		private final SMStateValue write_count;
+
+		private final SMStateEnum<ReadingStates> read_state;
+		private final SMStateEnum<ProcessingStates> process_state;
+		private final SMStateEnum<WritingStates> write_state;
+
+		private final SMOutput reading;
+		private final SMOutput processing;
+		private final SMOutput writing;
+
+		private final int addr_width;
+		private final SMInput nhd1_size;
+		private final SMInput intra_halo_size;
+		private final SMInput nhd2_size;
+
+
+
+		public ResControlSM(KernelLib owner, int width) {
+			super(owner);
+			this.addr_width = width;
+			read_count		= state.value(smUInt(width), 0);
+			process_count 	= state.value(smUInt(width), 0);
+			write_count 	= state.value(smUInt(width), 0);
+
+			read_state 		= state.enumerated(ReadingStates.class, ReadingStates.ENABLED);
+			process_state	= state.enumerated(ProcessingStates.class, ProcessingStates.DISABLED);
+			write_state 	= state.enumerated(WritingStates.class, WritingStates.DISABLED);
+
+			nhd1_size 		= io.input("nhd1_size", smUInt(addr_width));
+			nhd2_size 		= io.input("nhd2_size", smUInt(addr_width));
+			intra_halo_size = io.input("intra_halo_size", smUInt(addr_width));
+
+			reading 		= io.output("reading", smBool());
+			processing 		= io.output("processing", smBool());
+			writing			= io.output("writing", smBool());
+
+		}
+
+		@Override
+		public void nextState() {
+			SMValue partition_size = nhd1_size + nhd2_size + intra_halo_size;
+
+
+			SWITCH (read_state) {
+				CASE (ReadingStates.ENABLED) {
+					IF (read_count === nhd1_size + intra_halo_size) {
+						process_state.next <== ProcessingStates.ENABLED;
+						read_count.next <== read_count + 1;
+					}
+					IF (read_count === partition_size - 1) {
+						read_state.next <== ReadingStates.DISABLED;
+						read_count.next <== 0;
+					}
+				}
+			}
+
+			SWITCH (process_state) {
+				CASE (ProcessingStates.ENABLED) {
+					IF (process_count === nhd1_size + intra_halo_size) {
+						write_state.next <== WritingStates.ENABLED;
+						process_count.next <== process_count + 1;
+					}
+					IF (process_count === partition_size) {
+						process_state.next <== ProcessingStates.DISABLED;
+						process_count.next <== 0;
+					}
+				}
+			}
+
+			SWITCH (write_state) {
+				CASE (WritingStates.ENABLED) {
+					IF (write_count === partition_size) {
+						write_state.next <== WritingStates.DISABLED;
+						read_state.next <== ReadingStates.ENABLED;
+						write_count.next <== 0;
+					} ELSE {
+						write_count.next <== write_count + 1;
+					}
+				}
+			}
+
+		}
+
+		@Override
+		public void outputFunction() {
+			reading 	<== read_state 		=== ReadingStates.ENABLED;
+			processing 	<== process_state 	=== ProcessingStates.ENABLED;
+			writing 	<== write_state 	=== WritingStates.ENABLED;
+		}
+
+}
