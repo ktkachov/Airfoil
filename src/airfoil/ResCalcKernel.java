@@ -10,6 +10,7 @@ import com.maxeler.maxcompiler.v1.kernelcompiler.SMIO;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Count;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Count.Counter;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Count.WrapMode;
+import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Mem.DualPortMemOutputs;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Mem.RamPortMode;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Mem.RamPortParams;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Mem.RamWriteMode;
@@ -64,30 +65,19 @@ public class ResCalcKernel extends Kernel {
 
 		HWVar input_count = control.count.makeCounter(input_counter_params).getCount();
 
-		HWVar process_partition = input_count >=(nhd1Size + intraHaloSize);
-		HWVar finished_reading = input_count >= partition_size;
-
-		Count.Params process_counter_params = control.count.makeParams(addr_width)
-			.withMax(partition_size)
-			.withWrapMode(WrapMode.STOP_AT_MAX)
-			.withEnable(process_partition);
-
-		HWVar process_counter = control.count.makeCounter(process_counter_params).getCount();
-		HWVar finished_processing = process_counter >= partition_size;
-
-		Count.Params write_output_params = control.count.makeParams(addr_width)
-			.withEnable(finished_processing)
-			.withMax(partition_size)
-			.withWrapMode(WrapMode.STOP_AT_MAX);
-
-		HWVar output_counter = control.count.makeCounter(write_output_params).getCount();
-
 		HWVar address = io.input("address", hwUInt(addr_width));
 
-		SMIO read_from_host_sm = addStateMachine("host_read", new ResInputSM(this, 10));
-		HWVar read_from_host = read_from_host_sm.getOutput("output");
-		KStruct input_data_dram = io.input("input_dram", input_struct_t, ~finished_reading);
-		KStruct input_data_host = io.input("input_host", input_struct_t, read_from_host);
+		SMIO control_sm = addStateMachine("io_control_sm", new ResControlSM(this, addr_width));
+		control_sm.connectInput("nhd1_size", nhd1Size);
+		control_sm.connectInput("nhd2_size", nhd2Size);
+		control_sm.connectInput("intra_halo_size", intraHaloSize);
+
+
+		HWVar reading_data = control_sm.getOutput("reading");
+		HWVar processing_data = control_sm.getOutput("processing");
+		HWVar outputting_data = control_sm.getOutput("writing");
+		KStruct input_data_dram = io.input("input_dram", input_struct_t, reading_data);
+		KStruct input_data_host = io.input("input_host", input_struct_t);
 
 		HWVar gm1 = io.scalarInput("gm1", float_t);
 		HWVar eps = io.scalarInput("eps", float_t);
@@ -99,43 +89,47 @@ public class ResCalcKernel extends Kernel {
 
 		RamPortParams<KStruct> ram_params_write = mem.makeRamPortParams(RamPortMode.WRITE_ONLY, input_count, input_data_dram.getType())
 			.withDataIn(input_data_dram)
-			.withWriteEnable(~finished_reading);
+			.withWriteEnable(reading_data);
 
 		KStruct partition_data = mem.ramDualPort(max_partition_size, RamWriteMode.READ_FIRST, ram_params_write, ram_params_read).getOutputB();
 
 
 		Count.Params host_ram_write_count_params = control.count.makeParams(MathUtils.bitsToAddress(halo_size))
-													.withEnable(read_from_host);
+													.withEnable(reading_data);
 		Counter host_ram_write_count = control.count.makeCounter(host_ram_write_count_params);
 		RamPortParams<KStruct> host_ram_params_write = mem.makeRamPortParams(RamPortMode.WRITE_ONLY, host_ram_write_count.getCount(), input_data_host.getType())
 														.withDataIn(input_data_host)
-														.withWriteEnable(read_from_host);
+														.withWriteEnable(reading_data);
 		Count.Params host_ram_read_count_params = control.count.makeParams(MathUtils.bitsToAddress(halo_size));
 		Counter host_ram_read_count = control.count.makeCounter(host_ram_read_count_params);
 		RamPortParams<KStruct> host_ram_params_read = mem.makeRamPortParams(RamPortMode.READ_ONLY, host_ram_read_count.getCount(), input_data_dram.getType());
 
 		KStruct host_ram_output = mem.ramDualPort(halo_size, RamWriteMode.READ_FIRST, host_ram_params_write, host_ram_params_read).getOutputB();
 
-
 		KStruct res_ram_contents = res_struct_t.newInstance(this);
-
 		KStruct partition_result = doResMath(partition_data, eps, gm1, res_ram_contents);
 //		KStruct result_host = doResMath(host_ram_output, eps, gm1, res_ram_contents);
 
 
 
 		RamPortParams<KStruct> write_res_params
-			= mem.makeRamPortParams(RamPortMode.WRITE_ONLY, address, partition_result.getType())
-				.withDataIn(partition_result).withWriteEnable(process_partition);
+			= mem.makeRamPortParams(RamPortMode.READ_WRITE, address, partition_result.getType())
+				.withDataIn(partition_result)
+				.withWriteEnable(processing_data);
 
-		HWVar res_ram_address = finished_processing ? output_counter : address;
+
+		Count.Params output_counter_params = control.count.makeParams(MathUtils.bitsToAddress(max_partition_size))
+			.withEnable(outputting_data)
+			.withWrapMode(WrapMode.COUNT_LT_MAX_THEN_WRAP);
+		HWVar output_address = control.count.makeCounter(output_counter_params).getCount();
+
 		RamPortParams<KStruct> read_res_params
-			= mem.makeRamPortParams(RamPortMode.READ_ONLY, res_ram_address, partition_result.getType());
+			= mem.makeRamPortParams(RamPortMode.READ_ONLY, output_address, partition_result.getType());
 
-		KStruct res_ram_output = mem.ramDualPort(max_partition_size, RamWriteMode.READ_FIRST, write_res_params, read_res_params).getOutputB();
-		res_ram_contents <== stream.offset(res_ram_output, -14); //FIXME: EXPLAIN!!!
+		DualPortMemOutputs<KStruct> res_ram_output = mem.ramDualPort(max_partition_size, RamWriteMode.READ_FIRST, write_res_params, read_res_params);
+		res_ram_contents <== stream.offset(res_ram_output.getOutputA(), -14); //FIXME: EXPLAIN!!!
 
-		io.output("result_dram", partition_result.getType(), finished_processing) <== partition_result;
+		io.output("result_dram", res_ram_contents.getType(), outputting_data) <== res_ram_output.getOutputB();
 //		io.output("result_host", result_host.getType()) <== result_host;
 	}
 
