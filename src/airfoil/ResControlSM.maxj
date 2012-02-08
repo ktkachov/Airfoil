@@ -28,6 +28,9 @@ public class ResControlSM extends KernelStateMachine {
 		private final SMStateValue read_count;
 		private final SMStateValue process_count;
 		private final SMStateValue write_count;
+		private final SMStateValue halo_read_count;
+		private final SMStateValue halo_delay_count;
+
 
 		private final SMStateEnum<ReadingStates> read_state;
 		private final SMStateEnum<ProcessingStates> process_state;
@@ -36,20 +39,28 @@ public class ResControlSM extends KernelStateMachine {
 		private final SMOutput reading;
 		private final SMOutput processing;
 		private final SMOutput writing;
+		private final SMOutput halo_read;
+
 
 		private final int addr_width;
+		private final int halo_read_delay;
+
 		private final SMInput nhd1_size;
 		private final SMInput intra_halo_size;
 		private final SMInput nhd2_size;
+		private final SMInput host_halo_size;
 
 
 
-		public ResControlSM(KernelLib owner, int width) {
+		public ResControlSM(KernelLib owner, int width, int halo_delay) {
 			super(owner);
 			this.addr_width = width;
+			this.halo_read_delay = halo_delay;
 			read_count		= state.value(smUInt(width), 0);
 			process_count 	= state.value(smUInt(width), 0);
 			write_count 	= state.value(smUInt(width), 0);
+			halo_read_count	= state.value(smUInt(width), 0);
+			halo_delay_count= state.value(smUInt(width), 0);
 
 			read_state 		= state.enumerated(ReadingStates.class, ReadingStates.ENABLED);
 			process_state	= state.enumerated(ProcessingStates.class, ProcessingStates.DISABLED);
@@ -58,16 +69,19 @@ public class ResControlSM extends KernelStateMachine {
 			nhd1_size 		= io.input("nhd1_size", smUInt(addr_width));
 			nhd2_size 		= io.input("nhd2_size", smUInt(addr_width));
 			intra_halo_size = io.input("intra_halo_size", smUInt(addr_width));
+			host_halo_size	= io.input("host_halo_size", smUInt(addr_width));
 
 			reading 		= io.output("reading", smBool());
 			processing 		= io.output("processing", smBool());
 			writing			= io.output("writing", smBool());
+			halo_read		= io.output("halo_read", smBool());
 
 		}
 
 		@Override
 		public void nextState() {
 			SMValue partition_size = nhd1_size + nhd2_size + intra_halo_size;
+
 
 
 			SWITCH (read_state) {
@@ -81,6 +95,7 @@ public class ResControlSM extends KernelStateMachine {
 						read_count.next <== 0;
 					}
 				}
+
 			}
 
 			SWITCH (process_state) {
@@ -108,6 +123,17 @@ public class ResControlSM extends KernelStateMachine {
 				}
 			}
 
+			IF (halo_read_count < host_halo_size) {
+				IF (halo_delay_count === halo_read_delay) {
+					halo_delay_count.next <== 0;
+					halo_read_count.next <== halo_read_count + 1;
+				} ELSE IF (read_state === ReadingStates.DISABLED) {
+					halo_read_count.next <== halo_read_count + 1;
+				} ELSE {
+					halo_delay_count.next <== halo_delay_count + 1;
+				}
+			}
+
 		}
 
 		@Override
@@ -115,6 +141,12 @@ public class ResControlSM extends KernelStateMachine {
 			reading 	<== read_state 		=== ReadingStates.ENABLED;
 			processing 	<== process_state 	=== ProcessingStates.ENABLED;
 			writing 	<== write_state 	=== WritingStates.ENABLED;
+			IF (read_state === ReadingStates.DISABLED) {
+				halo_read <== halo_read_count < host_halo_size;
+			} ELSE {
+				halo_read <== halo_delay_count === halo_read_delay;
+			}
+//			halo_read	<== read_state === ReadingStates.DISABLED ? halo_read_count < host_halo_size : halo_delay_count === halo_read_delay;
 		}
 
 }
