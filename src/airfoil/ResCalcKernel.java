@@ -7,8 +7,7 @@ import static utils.Utils.float_t;
 import com.maxeler.maxcompiler.v1.kernelcompiler.Kernel;
 import com.maxeler.maxcompiler.v1.kernelcompiler.KernelParameters;
 import com.maxeler.maxcompiler.v1.kernelcompiler.SMIO;
-import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Count;
-import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Count.WrapMode;
+import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Mem;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Mem.DualPortMemOutputs;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Mem.RamPortMode;
 import com.maxeler.maxcompiler.v1.kernelcompiler.stdlib.core.Mem.RamPortParams;
@@ -23,21 +22,29 @@ import com.maxeler.maxcompiler.v1.utils.MathUtils;
 
 public class ResCalcKernel extends Kernel {
 
-	private final int max_partition_size = 1<<14;
+	private final int max_partition_size = 1<<13;
 	private final int halo_size = 1<<7;
-	private final int ram_size = halo_size + max_partition_size;
-	private final int input_data_count_width = MathUtils.bitsToAddress(ram_size);
-	private final HWType input_data_count_t = hwUInt(input_data_count_width);
 
-	private final KStructType input_struct_t
+	private final KStructType node_struct_t
 		= new KStructType(
-				KStructType.sft("x1", array2_t),
-				KStructType.sft("x2", array2_t),
-				KStructType.sft("q1", array4_t),
-				KStructType.sft("q2", array4_t),
-				KStructType.sft("adt1", float_t),
-				KStructType.sft("adt2", float_t)
+				KStructType.sft("x", array2_t)
 			);
+
+	private final KStructType cell_struct_t
+		= new KStructType(
+				KStructType.sft("q", array4_t),
+				KStructType.sft("adt", float_t)
+		);
+
+	final int addr_width = MathUtils.bitsToAddress(max_partition_size);
+	final HWType addr_t = hwUInt(addr_width);
+	private final KStructType address_struct_t
+		= new KStructType(
+				KStructType.sft("node1", addr_t),
+				KStructType.sft("node2", addr_t),
+				KStructType.sft("cell1", addr_t),
+				KStructType.sft("cell2", addr_t)
+		);
 
 	private final KStructType res_struct_t
 		= new KStructType(
@@ -49,22 +56,13 @@ public class ResCalcKernel extends Kernel {
 	public ResCalcKernel(KernelParameters params) {
 		super(params);
 
-		final int addr_width = MathUtils.bitsToAddress(ram_size);
-
-		HWVar nhd1Size = io.scalarInput("nhd1Size", input_data_count_t);
-		HWVar nhd2Size = io.scalarInput("nhd2Size", input_data_count_t);
-		HWVar intraHaloSize = io.scalarInput("intraHaloSize", input_data_count_t);
-		HWVar haloDataSize = io.scalarInput("halo_size", input_data_count_t);
+		HWVar nhd1Size = io.scalarInput("nhd1Size", addr_t);
+		HWVar nhd2Size = io.scalarInput("nhd2Size", addr_t);
+		HWVar intraHaloSize = io.scalarInput("intraHaloSize", addr_t);
+		HWVar haloDataSize = io.scalarInput("halo_size", addr_t);
 
 		HWVar partition_size = nhd1Size + nhd2Size + intraHaloSize;
 
-		Count.Params input_counter_params = control.count.makeParams(addr_width)
-			.withMax(partition_size)
-			.withWrapMode(WrapMode.STOP_AT_MAX);
-
-		HWVar input_count = control.count.makeCounter(input_counter_params).getCount();
-
-		HWVar address = io.input("address", hwUInt(addr_width));
 
 		SMIO control_sm = addStateMachine("io_control_sm", new ResControlSM(this, addr_width, 10));
 		control_sm.connectInput("host_halo_size", haloDataSize);
@@ -77,67 +75,136 @@ public class ResCalcKernel extends Kernel {
 		HWVar processing_data = control_sm.getOutput("processing");
 		HWVar outputting_data = control_sm.getOutput("writing");
 		HWVar read_host_halo = control_sm.getOutput("halo_read");
-		KStruct input_data_dram = io.input("input_dram", input_struct_t, reading_data);
-		KStruct input_data_host = io.input("input_host", input_struct_t, read_host_halo);
+
+		KStruct node_input_dram = io.input("node_input_dram", node_struct_t, reading_data);
+		KStruct cell_input_dram = io.input("cell_input_dram", cell_struct_t, reading_data);
+		KStruct address_struct = io.input("addresses", address_struct_t);
+		KStruct cell_data_host = io.input("input_host", cell_struct_t, read_host_halo);
 
 		HWVar gm1 = io.scalarInput("gm1", float_t);
 		HWVar eps = io.scalarInput("eps", float_t);
 
 
-		HWVar halo_write_count
-			= control.count.makeCounter(control.count.makeParams(addr_width)
-				.withEnable(read_host_halo)
-				.withMax(haloDataSize)).getCount();
+		HWVar ram_write_counter = control.count.simpleCounter(addr_width, max_partition_size);
 
-		RamPortParams<KStruct> ram_params_read
-			= mem.makeRamPortParams(RamPortMode.READ_WRITE, read_host_halo ? (halo_write_count + max_partition_size) : address, input_data_dram.getType())
-				.withDataIn(input_data_host)
-				.withWriteEnable(read_host_halo);
-
-
-		RamPortParams<KStruct> ram_params_write = mem.makeRamPortParams(RamPortMode.READ_WRITE, input_count, input_data_dram.getType())
-			.withDataIn(input_data_dram)
-			.withWriteEnable(reading_data);
-
-		KStruct partition_data = mem.ramDualPort(ram_size, RamWriteMode.READ_FIRST, ram_params_write, ram_params_read).getOutputB();
+		// RAMs for the node data
+		Mem.RamPortParams<KStruct> node_ram_portA_params
+			= mem.makeRamPortParams(RamPortMode.READ_WRITE, ram_write_counter, node_struct_t)
+				.withDataIn(node_input_dram)
+				.withWriteEnable(reading_data)
+				;
+		HWVar node1_addr = address_struct["node1"];
+		RamPortParams<KStruct> node_ram1_portB_params
+			= mem.makeRamPortParams(RamPortMode.READ_ONLY, node1_addr, node_struct_t);
+		Mem.DualPortMemOutputs<KStruct> node_ram1_output
+			= mem.ramDualPort(max_partition_size, RamWriteMode.WRITE_FIRST, node_ram_portA_params, node_ram1_portB_params);
 
 
-		KStruct res_ram_contents = res_struct_t.newInstance(this);
-		KStruct partition_result = doResMath(partition_data, eps, gm1, res_ram_contents);
-//		KStruct result_host = doResMath(host_ram_output, eps, gm1, res_ram_contents);
+		HWVar node2_addr = address_struct["node2"];
+		RamPortParams<KStruct> node_ram2_portB_params
+			= mem.makeRamPortParams(RamPortMode.READ_ONLY, node2_addr, node_struct_t);
+		Mem.DualPortMemOutputs<KStruct> node_ram2_output
+			= mem.ramDualPort(max_partition_size, RamWriteMode.WRITE_FIRST, node_ram_portA_params, node_ram2_portB_params);
+
+		//RAMs for cell data
+		Mem.RamPortParams<KStruct> cell_ram_portA_params
+		= mem.makeRamPortParams(RamPortMode.READ_WRITE, ram_write_counter, cell_struct_t)
+			.withDataIn(cell_input_dram)
+			.withWriteEnable(reading_data)
+			;
+		HWVar cell1_addr = address_struct["cell1"];
+		RamPortParams<KStruct> cell_ram1_portB_params
+			= mem.makeRamPortParams(RamPortMode.READ_ONLY, cell1_addr, cell_struct_t);
+		Mem.DualPortMemOutputs<KStruct> cell_ram1_output
+			= mem.ramDualPort(max_partition_size, RamWriteMode.WRITE_FIRST, cell_ram_portA_params, cell_ram1_portB_params);
+
+		HWVar cell2_addr = address_struct["cell2"];
+		RamPortParams<KStruct> cell_ram2_portB_params
+			= mem.makeRamPortParams(RamPortMode.READ_ONLY, cell2_addr, cell_struct_t);
+		Mem.DualPortMemOutputs<KStruct> cell_ram2_output
+			= mem.ramDualPort(max_partition_size, RamWriteMode.WRITE_FIRST, cell_ram_portA_params, cell_ram2_portB_params);
 
 
-		RamPortParams<KStruct> write_res_params
-			= mem.makeRamPortParams(RamPortMode.READ_WRITE, address.cast(hwUInt(addr_width)), partition_result.getType())
-				.withDataIn(partition_result)
-				.withWriteEnable(processing_data);
+		//The arithmetic pipeline
+		KStruct res_vector = doResMath(
+					node_ram1_output.getOutputB(),
+					node_ram2_output.getOutputB(),
+					cell_ram1_output.getOutputB(),
+					cell_ram2_output.getOutputB(),
+					eps,
+					gm1
+				);
 
 
-		Count.Params output_counter_params = control.count.makeParams(addr_width)
-			.withEnable(outputting_data)
-			.withWrapMode(WrapMode.COUNT_LT_MAX_THEN_WRAP);
-		HWVar output_address = control.count.makeCounter(output_counter_params).getCount();
 
-		RamPortParams<KStruct> read_res_params
-			= mem.makeRamPortParams(RamPortMode.READ_ONLY, output_address, partition_result.getType());
+		KArray<HWVar> previous_res_value_cell1 = array4_t.newInstance(this);
+		KArray<HWVar> previous_res_value_cell2 = array4_t.newInstance(this);
 
-		DualPortMemOutputs<KStruct> res_ram_output = mem.ramDualPort(ram_size, RamWriteMode.READ_FIRST, write_res_params, read_res_params);
-		res_ram_contents <== stream.offset(res_ram_output.getOutputA(), -14); //FIXME: EXPLAIN!!!
+		KArray<HWVar> new_res_value_cell1 = array4_t.newInstance(this);
+		KArray<HWVar> new_res_value_cell2 = array4_t.newInstance(this);
+		KArray<HWVar> zeroes = array4_t.newInstance(this);
 
-		io.output("result_dram", res_ram_contents.getType(), outputting_data) <== res_ram_output.getOutputB();
-//		io.output("result_host", result_host.getType()) <== result_host;
+		for (int i = 0; i < array4_t.getSize(); ++i) {
+			KArray<HWVar> res1 = res_vector.get("res1");
+			new_res_value_cell1[i] <== previous_res_value_cell1[i] + res1[i];
+
+			KArray<HWVar> res2 = res_vector.get("res2");
+			new_res_value_cell2[i] <== previous_res_value_cell2[i] + res2[i];
+
+			zeroes[i] <== float_t.newInstance(this, 0.0);
+
+		}
+
+
+		//Rams for res data
+		Mem.RamPortParams<KArray<HWVar>> res_ram1_portA_params
+			= mem.makeRamPortParams(RamPortMode.READ_WRITE, cell1_addr, array4_t)
+				.withDataIn(new_res_value_cell1)
+			;
+		Mem.RamPortParams<KArray<HWVar>> res_ram1_portB_params
+			= mem.makeRamPortParams(RamPortMode.READ_WRITE, ram_write_counter, array4_t)
+				.withDataIn(zeroes)
+				.withWriteEnable(hwBool().newInstance(this, false))
+				;
+		DualPortMemOutputs<KArray<HWVar>> res_ram1_output = mem.ramDualPort(max_partition_size, RamWriteMode.READ_FIRST, res_ram1_portA_params, res_ram1_portB_params);
+
+		previous_res_value_cell1 <== stream.offset(res_ram1_output.getOutputA(), -14);
+
+
+		Mem.RamPortParams<KArray<HWVar>> res_ram2_portA_params
+		= mem.makeRamPortParams(RamPortMode.READ_WRITE, cell2_addr, array4_t)
+			.withDataIn(new_res_value_cell2)
+		;
+		Mem.RamPortParams<KArray<HWVar>> res_ram2_portB_params
+			= mem.makeRamPortParams(RamPortMode.READ_WRITE, ram_write_counter, array4_t)
+				.withDataIn(zeroes)
+				.withWriteEnable(hwBool().newInstance(this, false))
+				;
+		DualPortMemOutputs<KArray<HWVar>> res_ram2_output = mem.ramDualPort(max_partition_size, RamWriteMode.READ_FIRST, res_ram2_portA_params, res_ram2_portB_params);
+
+		previous_res_value_cell2 <== stream.offset(res_ram2_output.getOutputA(), -14);
+
+
+
+		KArray<HWVar> res_output = array4_t.newInstance(this);
+		for (int i = 0; i < res_output.getSize(); ++i) {
+			res_output[i] <== res_ram1_output.getOutputB()[i] + res_ram2_output.getOutputB()[i];
+		}
+
+
+		io.output("result_dram", res_output.getType()) <== res_output;
 	}
 
 
 	// The math that produces the res1 and res2 vectors
-	KStruct doResMath(KStruct input_data, HWVar eps, HWVar gm1, KStruct current_res){
+	KStruct doResMath(KStruct node1, KStruct node2, KStruct cell1, KStruct cell2, HWVar eps, HWVar gm1){
 
-		KArray<HWVar> x1 = input_data["x1"];
-		KArray<HWVar> x2 = input_data["x2"];
-		KArray<HWVar> q1 = input_data["q1"];
-		KArray<HWVar> q2 = input_data["q2"];
-		HWVar adt1 = input_data["adt1"];
-		HWVar adt2 = input_data["adt2"];
+		KArray<HWVar> x1 = node1["x"];
+		KArray<HWVar> x2 = node2["x"];
+		KArray<HWVar> q1 = cell1["q"];
+		KArray<HWVar> q2 = cell2["q"];
+		HWVar adt1 = cell1["adt"];
+		HWVar adt2 = cell2["adt"];
 		HWVar mu = 0.5f*(adt1+adt2)*eps;
 
 		HWVar dx = x1[0] - x2[0];
@@ -153,24 +220,22 @@ public class ResCalcKernel extends Kernel {
 		KStruct result = res_struct_t.newInstance(this);
 		KArray<HWVar> res1 = result["res1"];
 		KArray<HWVar> res2 = result["res2"];
-		KArray<HWVar> curr_res1 = current_res["res1"];
-		KArray<HWVar> curr_res2 = current_res["res2"];
 
 		HWVar f = 0.5f*(vol1* q1[0] + vol2* q2[0]) + mu*(q1[0]-q2[0]);
-		res1[0] <== curr_res1[0] + f;
-		res2[0] <== curr_res2[0] - f;
+		res1[0] <==  f;
+		res2[0] <== -f;
 
 		f = 0.5f*(vol1* q1[1] + p1*dy + vol2* q2[1] + p2*dy) + mu*(q1[1]-q2[1]);
-		res1[1] <== curr_res1[1] + f;
-		res2[1] <== curr_res2[1] - f;
+		res1[1] <==  f;
+		res2[1] <== -f;
 
 		f = 0.5f*(vol1* q1[2] - p1*dx + vol2* q2[2] - p2*dx) + mu*(q1[2]-q2[2]);
-		res1[2] <== curr_res1[2] + f;
-		res2[2] <== curr_res2[2] - f;
+		res1[2] <==  f;
+		res2[2] <== -f;
 
 		f = 0.5f*(vol1*(q1[3]+p1)     + vol2*(q2[3]+p2)    ) + mu*(q1[3]-q2[3]);
-		res1[3] <== curr_res1[3] + f;
-		res2[3] <== curr_res2[3] - f;
+		res1[3] <==  f;
+		res2[3] <== -f;
 
 		return result;
 
