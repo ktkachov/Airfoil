@@ -40,6 +40,7 @@ public class ResControlSM extends KernelStateMachine {
 		private final SMOutput processing;
 		private final SMOutput writing;
 		private final SMOutput halo_read;
+		private final SMOutput read_sizes;
 
 
 		private final int addr_width;
@@ -75,13 +76,13 @@ public class ResControlSM extends KernelStateMachine {
 			processing 		= io.output("processing", smBool());
 			writing			= io.output("writing", smBool());
 			halo_read		= io.output("halo_read", smBool());
+			read_sizes 		= io.output("read_sizes", smBool());
 
 		}
 
 		@Override
 		public void nextState() {
 			SMValue partition_size = nhd1_size + nhd2_size + intra_halo_size;
-
 
 
 			SWITCH (read_state) {
@@ -146,6 +147,8 @@ public class ResControlSM extends KernelStateMachine {
 			} ELSE {
 				halo_read <== halo_delay_count === halo_read_delay;
 			}
+			read_sizes <== read_count === 0; //FIXME: Probably wrong for now!!!
+
 //			halo_read	<== read_state === ReadingStates.DISABLED ? halo_read_count < host_halo_size : halo_delay_count === halo_read_delay;
 		}
 
